@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+
+#  LICENSE
+#
+#    Copyright 2019 Preston Hunt <me@prestonhunt.com>
+#
+#    Licensed under the Apache License, Version 2.0 (the "License");
+#    you may not use this file except in compliance with the License.
+#    You may obtain a copy of the License at
+#
+#        http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS,
+#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#    See the License for the specific language governing permissions and
+#    limitations under the License.
+
+import argparse
+from datetime import datetime, timedelta
+import subprocess
+import sys
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.description = """
+zscrub is a program to help ensure that ZFS pools are scrubbed periodically.
+zscrub is intended to be run daily from cron or systemd. For each ZFS pool
+listed (default is all pools), zscrub attempts to ensure that that pool
+is scrubbed every N days (default 7).  If a pool has not been scrubbed after M
+days (default=N*2 days), a warning is issued.
+
+zscrub exits with return code 0 if all pools have been scrubbed within N
+days. Exits with 1 if at least one pool has an overdue scrub or some other
+issue.
+"""
+    parser.add_argument("pools", nargs='*', default=[], help="pools to check (if not specified, all pools are checked)")
+    parser.add_argument("--days", type=int, default=7, help="ensure pools are scrubbed every 'days' days (default: 7)")
+    parser.add_argument("--warn-days", type=int, default=14, help="warn if a pool has not been scrubbed after this many days (default: 14)")
+    parser.add_argument("--dry-run", default=False, action='store_true', help="don't take any actions")
+    parser.add_argument("--verbose", default=False, action='store_true', help="show more output")
+    return parser.parse_args()
+
+
+def get_all_pools():
+    zpool_list = subprocess.check_output(["zpool", "list"]).decode().split('\n')
+    result = []
+    for line in zpool_list:
+        if line:
+            parts = line.split()
+            if parts[0] != 'NAME':
+                result.append(parts[0])
+    return result
+
+
+def print_pool(pool, *args, **kwargs):
+    print(f"ZFS pool '{pool}':", *args, *kwargs)
+
+
+def check_status(poolname, days, verbose=False):
+    zpool_status = subprocess.check_output(["zpool", "status", poolname]).decode().split('\n')
+    for line in zpool_status:
+        line = line.strip()
+        if 'scan:' not in line:
+            continue
+        if verbose:
+            print_pool(poolname, 'zpool status command returned:', line)
+        if 'scrub repaired' in line:
+            parts = line.split()
+            date_str = ' '.join(parts[13:])
+            scrub_date = datetime.strptime(date_str, '%b %d %H:%M:%S %Y')
+            scrub_age = datetime.now() - scrub_date
+            if scrub_age > timedelta(days=days):
+                return dict(status='scrub-needed', last_scrub_date=scrub_date, last_scrub_age=scrub_age)
+            else:
+                return dict(status='scrub-not-needed', last_scrub_date=scrub_date, last_scrub_age=scrub_age)
+        elif 'scrub in progress' in line:
+            return dict(status='scrub-in-progress')
+        elif 'scrub canceled' in line:
+            return dict(status='scrub-needed', last_scrub_date=None, last_scrub_age=None)
+        else:
+            raise Exception(f'unhandled: {line}')
+    return dict(status='error', reason='unable to find scan: output in zpool status')
+
+
+def start_scrub(poolname, dry_run=False):
+    cmd = ["zpool", "scrub", poolname]
+    if dry_run:
+        print(f"(dry run) would start '{' '.join(cmd)}' now")
+    else:
+        subprocess.check_output(cmd)
+
+
+def scrub_pools(pools, days, warn_days, dry_run=False, verbose=False):
+    results = {}
+    scrub_in_progress = None
+    scrub_needed = None
+    retcode = 0
+
+    for pool in pools:
+        results[pool] = result = check_status(pool, days, verbose=verbose)
+        extra = ""
+        if result['status'] == 'scrub-in-progress':
+            scrub_in_progress = pool
+        elif result['status'] == 'scrub-needed':
+            scrub_needed = pool
+            age = result['last_scrub_age']
+            if age is None:
+                extra = f"unable to determine the last scrub time"
+            elif age >= timedelta(days=warn_days):
+                extra = f"pool has not been scrubbed for {age.days} days"
+                retcode = 1
+        print_pool(pool, f"{result['status']}{': ' if extra else ''}{extra}")
+
+    if scrub_needed:
+        if scrub_in_progress:
+            print(f'{scrub_needed} needs scrubbing, but scrub of {scrub_in_progress} is already in progress; ' \
+                  f'to avoid scrubbing multiple pools at the same time, not starting scrub of {scrub_needed} at this time.')
+        else:
+            start_scrub(scrub_needed, dry_run)
+            print_pool(scrub_needed, 'started scrub')
+
+    return retcode
+
+
+def main():
+    args = parse_args()
+    pools = args.pools or get_all_pools()
+    return scrub_pools(pools, args.days, args.warn_days, args.dry_run, args.verbose)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

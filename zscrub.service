@@ -1,0 +1,8 @@
+[Unit]
+Description=Check ZFS pool scrub status
+Requires=zfs.target
+After=zfs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/zscrub
