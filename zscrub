@@ -66,7 +66,9 @@ def check_status(poolname, days, verbose=False):
             continue
         if verbose:
             print_pool(poolname, 'zpool status command returned:', line)
-        if 'scrub repaired' in line:
+        if 'resilver' in line:
+            return dict(status='resilver-in-progress', extra='deferring scrub check until resilver is complete')
+        elif 'scrub repaired' in line:
             parts = line.split()
             date_str = ' '.join(parts[13:])
             scrub_date = datetime.strptime(date_str, '%b %d %H:%M:%S %Y')
@@ -100,7 +102,7 @@ def scrub_pools(pools, days, warn_days, dry_run=False, verbose=False):
 
     for pool in pools:
         results[pool] = result = check_status(pool, days, verbose=verbose)
-        extra = ""
+        extra = result.get('extra', '')
         if result['status'] == 'scrub-in-progress':
             scrub_in_progress = pool
         elif result['status'] == 'scrub-needed':
